@@ -26,7 +26,7 @@ KLIPPER_DEFAULT_EXEC = os.path.expanduser("~/klippy-env/bin/python")
 
 BASE_CONFIG: Dict[str, Dict[str, str]] = {
     "moonraker": {
-        "origin": "https://github.com/arksine/moonraker.git",
+        "origin": "https://github.com/OpenAMSOrg/moonraker.git",
         "requirements": "scripts/moonraker-requirements.txt",
         "venv_args": "-p python3",
         "system_dependencies": "scripts/system-dependencies.json",
