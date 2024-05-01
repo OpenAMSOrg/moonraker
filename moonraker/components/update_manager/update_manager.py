@@ -10,6 +10,7 @@ import os
 import logging
 import time
 import tempfile
+import pathlib
 from .common import AppType, get_base_configuration, get_app_type
 from .base_deploy import BaseDeploy
 from .app_deploy import AppDeploy
@@ -17,6 +18,7 @@ from .git_deploy import GitDeploy
 from .zip_deploy import ZipDeploy
 from .system_deploy import PackageDeploy
 from ...common import RequestType
+from ...utils.filelock import AsyncExclusiveFileLock, LockTimeout
 
 # Annotation imports
 from typing import (
@@ -64,6 +66,7 @@ class UpdateManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.instance_tracker = InstanceTracker(self.server)
         self.kconn: KlippyConnection
         self.kconn = self.server.lookup_component("klippy_connection")
         self.app_config = get_base_configuration(config)
@@ -178,6 +181,7 @@ class UpdateManager:
         return self.updaters
 
     async def component_init(self) -> None:
+        await self.instance_tracker.set_instance_id()
         # Prune stale data from the database
         umdb = self.cmd_helper.get_umdb()
         db_keys = await umdb.keys()
@@ -495,6 +499,7 @@ class UpdateManager:
     async def close(self) -> None:
         if self.refresh_timer is not None:
             self.refresh_timer.stop()
+        await self.instance_tracker.close()
         for updater in self.updaters.values():
             ret = updater.close()
             if ret is not None:
@@ -664,6 +669,67 @@ class CommandHelper:
 
         eventloop = self.server.get_event_loop()
         return await eventloop.run_in_thread(_createdir, suffix, prefix)
+
+class InstanceTracker:
+    def __init__(self, server: Server) -> None:
+        self.server = server
+        self.inst_id = ""
+        tmpdir = pathlib.Path(tempfile.gettempdir())
+        self.inst_file_path = tmpdir.joinpath("moonraker_instance_ids")
+
+    def get_instance_id(self) -> str:
+        machine: Machine = self.server.lookup_component("machine")
+        cur_name = "".join(machine.unit_name.split())
+        cur_uuid: str = self.server.get_app_args()["instance_uuid"]
+        pid = os.getpid()
+        return f"{cur_name}:{cur_uuid}:{pid}"
+
+    async def _read_instance_ids(self) -> List[str]:
+        if not self.inst_file_path.exists():
+            return []
+        eventloop = self.server.get_event_loop()
+        id_data = await eventloop.run_in_thread(self.inst_file_path.read_text)
+        return [iid.strip() for iid in id_data.strip().splitlines() if iid.strip()]
+
+    async def set_instance_id(self) -> None:
+        try:
+            async with AsyncExclusiveFileLock(self.inst_file_path, 2.):
+                self.inst_id = self.get_instance_id()
+                iids = await self._read_instance_ids()
+                if self.inst_id not in iids:
+                    iids.append(self.inst_id)
+                iid_string = "\n".join(iids)
+                if len(iids) > 1:
+                    self.server.add_log_rollover_item(
+                        "um_multi_instance_msg",
+                        "Multiple instances of Moonraker have the update "
+                        f"manager enabled.\n{iid_string}"
+                    )
+                eventloop = self.server.get_event_loop()
+                await eventloop.run_in_thread(
+                    self.inst_file_path.write_text, iid_string
+                )
+        except LockTimeout as e:
+            logging.info(str(e))
+        except Exception:
+            logging.exception("Failed to set instance id")
+
+    async def close(self) -> None:
+        try:
+            async with AsyncExclusiveFileLock(self.inst_file_path, 2.):
+                # Remove current id
+                iids = await self._read_instance_ids()
+                if self.inst_id in iids:
+                    iids.remove(self.inst_id)
+                iid_string = "\n".join(iids)
+                eventloop = self.server.get_event_loop()
+                await eventloop.run_in_thread(
+                    self.inst_file_path.write_text, iid_string
+                )
+        except LockTimeout as e:
+            logging.info(str(e))
+        except Exception:
+            logging.exception("Failed to remove instance id")
 
 
 def load_component(config: ConfigHelper) -> UpdateManager:
